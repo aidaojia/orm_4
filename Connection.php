@@ -6,6 +6,7 @@ use DateTime;
 use Illuminate\Events\Dispatcher;
 use Illuminate\Database\Query\Processors\Processor;
 use Doctrine\DBAL\Connection as DoctrineConnection;
+use App\Library\Util\DbSync;
 
 class Connection implements ConnectionInterface {
 
@@ -128,6 +129,8 @@ class Connection implements ConnectionInterface {
 	 */
 	protected $config = array();
 
+	protected $dbSync = null;
+
 	/**
 	 * Create a new database connection instance.
 	 *
@@ -156,6 +159,8 @@ class Connection implements ConnectionInterface {
 		$this->useDefaultQueryGrammar();
 
 		$this->useDefaultPostProcessor();
+
+		$this->dbSync = DbSync::getInstance();
 	}
 
 	/**
@@ -360,24 +365,26 @@ class Connection implements ConnectionInterface {
 	 */
 	public function statement($query, $bindings = array())
 	{
+		if ($this->dbSync->isInsert($query)) {
+            $affected = $this->affectingStatement($query, $bindings);
+
+            return $affected > 0 ? true : false;
+        }
+
+        if ($this->dbSync->isUpdate($query)) {
+            $this->dbSync->hookUpdate($query, $this->prepareBindings($bindings));
+        }
+        elseif ($this->dbSync->isDelete($query)) {
+            $this->dbSync->hookDelete($query, $this->prepareBindings($bindings));
+        }
+
 		return $this->run($query, $bindings, function($me, $query, $bindings)
 		{
 			if ($me->pretending()) return true;
 
 			$bindings = $me->prepareBindings($bindings);
 
-			$pdo = $me->getPdo();
-			$obj = $pdo->prepare($query);
-			$res = $obj->execute($bindings);
-
-			if (\App\Library\Util\Database::isInsert($query)) {
-				$id = $pdo->lastInsertId();
-				$affected = $obj->rowCount();
-
-				\App\Library\Util\Database::hookQueryInsert($query, $bindings, $id, $affected);
-			}
-
-			return $res;
+			return $me->getPdo()->prepare($query)->execute($bindings);
 		});
 	}
 
@@ -390,11 +397,16 @@ class Connection implements ConnectionInterface {
 	 */
 	public function affectingStatement($query, $bindings = array())
 	{
-		return $this->run($query, $bindings, function($me, $query, $bindings)
+		if ($this->dbSync->isUpdate($query)) {
+            $this->dbSync->hookUpdate($query, $this->prepareBindings($bindings));
+        }
+        elseif ($this->dbSync->isDelete($query)) {
+            $this->dbSync->hookDelete($query, $this->prepareBindings($bindings));
+        }
+
+		$affected = $this->run($query, $bindings, function($me, $query, $bindings)
 		{
 			if ($me->pretending()) return 0;
-
-			\App\Library\Util\Database::hookQueryUpdateAndDelete($query, $bindings);
 
 			// For update or delete statements, we want to get the number of rows affected
 			// by the statement and return that back to the developer. We'll first need
@@ -405,6 +417,15 @@ class Connection implements ConnectionInterface {
 
 			return $statement->rowCount();
 		});
+
+		if ($this->dbSync->isInsert($query)) {
+            if ($affected > 0) {
+                $lastId = $this->getPdo()->lastInsertId();
+                $this->dbSync->hookInsert($query, $lastId, $affected);
+            }
+        }
+
+        return $affected;
 	}
 
 	/**
